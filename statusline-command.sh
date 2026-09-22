@@ -360,18 +360,23 @@ def from_snapshot(cands, lines):
 PATH_STOP = set(" \t\r\n\"\x27\x60()[]{}<>,;:=|")
 
 
-# A mention counts as activity only when the line shows worktree bookkeeping --
-# a worktree-management command naming the path, or a cd into it -- rather than
-# plain prose. Without this gate any sentence mentioning a path is evidence,
-# and prose outranks real writes: the closing report of every turn mentions
-# paths, and on a real transcript it beat a genuine write by ~2 minutes and
-# flipped feature/F3.3-accuracy-recovery to develop. The gate keeps the
-# cold-start case (worktree just created, nothing written in it yet) because
-# that is exactly what "worktree add"/"cd" look like.
-WORKTREE_OP = re.compile(r"worktree\s+(?:add|move|remove|prune)\b")
-# Whatever may sit between the command and its argument: a shell separator, a
-# JSON quote (the transcript wraps the command in "message":"..."), or the
-# start of the string.
+# A mention counts as activity only when THIS path is the argument of a worktree
+# operation, or immediately follows a cd -- not when the line merely mentions
+# some operation somewhere. Without the gate any sentence mentioning a path is
+# evidence, and prose outranks real writes: the closing report of every turn
+# mentions paths, and on a real transcript it beat a genuine write by ~2 minutes
+# and flipped feature/F3.3-accuracy-recovery to develop. Binding to the path
+# matters just as much: "worktree add <A> ; inspect <B>" must credit A, not B.
+#
+# worktree prune is deliberately absent: it takes no path argument, so a prune
+# line says nothing about WHICH worktree is active.
+WT_OP = re.compile(r"worktree\s+(?:add|move|remove)\b")
+# What ends an operation's argument region. A quote counts: the transcript
+# wraps commands as "message":"...", so a quote between the operation and the
+# path means the path sits in a different field. A quote immediately BEFORE the
+# path is outside this span, which is what keeps quoted paths working.
+ARG_END = re.compile(r"[;|&\n\"\x27\x60]")
+# Whatever may sit before a cd: a shell separator, a JSON quote, or nothing.
 CD_BEFORE = re.compile(r"(?:^|[\s;&|(\"\x27\x60])cd\s+[\"\x27\x60]?$")
 
 
@@ -392,9 +397,22 @@ def from_text(cands, lines, pattern):
         matches = list(pattern.finditer(line))
         if not matches:
             continue
-        op = bool(WORKTREE_OP.search(line))
         for m in reversed(matches):
-            if not op and not CD_BEFORE.search(line[:m.start()]):
+            ok = bool(CD_BEFORE.search(line[:m.start()]))
+            if not ok:
+                for op in WT_OP.finditer(line):
+                    if op.end() > m.start():
+                        break
+                    between = line[op.end():m.start()].rstrip()
+                    # A quote sitting immediately before the path is the path's
+                    # OWN opening quote, not a field boundary -- drop it before
+                    # looking for separators, so "worktree move \"p\"" counts.
+                    if between[-1:] in ("\"", "\x27", "\x60"):
+                        between = between[:-1]
+                    if not ARG_END.search(between):
+                        ok = True
+                        break
+            if not ok:
                 continue
             end = m.end()
             while end < len(line) and line[end] not in PATH_STOP:
