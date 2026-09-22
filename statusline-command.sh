@@ -203,7 +203,13 @@ def safe_gitdir(path):
         return None
     if not head.startswith("gitdir:"):
         return None
-    return os.path.realpath(head[len("gitdir:"):].strip())
+    raw = head[len("gitdir:"):].strip()
+    # git 2.48+ can write this relative, with --relative-paths or
+    # worktree.useRelativePaths=true, and then it is relative to the WORKTREE
+    # root -- not to this process's cwd, which is what realpath() would use.
+    if raw and not os.path.isabs(raw):
+        raw = os.path.join(path, raw)
+    return os.path.realpath(raw)
 
 
 def candidates(repo):
@@ -354,14 +360,30 @@ def from_snapshot(cands, lines):
 PATH_STOP = set(" \t\r\n\"\x27\x60()[]{}<>,;:=|")
 
 
+# A mention counts as activity only when the line shows worktree bookkeeping --
+# a worktree-management command naming the path, or a cd into it -- rather than
+# plain prose. Without this gate any sentence mentioning a path is evidence,
+# and prose outranks real writes: the closing report of every turn mentions
+# paths, and on a real transcript it beat a genuine write by ~2 minutes and
+# flipped feature/F3.3-accuracy-recovery to develop. The gate keeps the
+# cold-start case (worktree just created, nothing written in it yet) because
+# that is exactly what "worktree add"/"cd" look like.
+WORKTREE_OP = re.compile(r"worktree\s+(?:add|move|remove|prune)\b")
+# Whatever may sit between the command and its argument: a shell separator, a
+# JSON quote (the transcript wraps the command in "message":"..."), or the
+# start of the string.
+CD_BEFORE = re.compile(r"(?:^|[\s;&|(\"\x27\x60])cd\s+[\"\x27\x60]?$")
+
+
 def from_text(cands, lines, pattern):
-    """Newest mention of a candidate path, read back to front.
+    """Newest mention of a candidate path that shows real worktree activity.
 
     Covers the gap between "worktree created" and "first file written into it",
     where the snapshot signal has nothing yet. The lookahead is what stops
-    .../F3.3-accuracy-reco from matching .../F3.3-accuracy-recognition.
+    .../F3.3-accuracy-reco from matching .../F3.3-accuracy-recognition; the
+    worktree-op / cd gate is what stops prose from counting (see above).
 
-    The match is widened to the whole path token before resolving, for the same
+    A match is widened to the whole path token before resolving, for the same
     reason the snapshot signal resolves gitdir first: <repo>/.git/worktrees/<id>
     /... starts with the main worktree's own path, so a bare prefix match would
     hand a linked worktree's state file to main.
@@ -370,21 +392,24 @@ def from_text(cands, lines, pattern):
         matches = list(pattern.finditer(line))
         if not matches:
             continue
-        m = matches[-1]
-        end = m.end()
-        while end < len(line) and line[end] not in PATH_STOP:
-            end += 1
-        token = line[m.start():end]
-        hit = owner_by_gitdir(cands, token) or owner(cands, m.group(1))
-        if not hit:
-            continue
-        ts = None
-        if '"timestamp"' in line:
-            try:
-                ts = parse_ts(json.loads(line).get("timestamp"))
-            except ValueError:
-                ts = None
-        return (ts, hit[1], hit[2])
+        op = bool(WORKTREE_OP.search(line))
+        for m in reversed(matches):
+            if not op and not CD_BEFORE.search(line[:m.start()]):
+                continue
+            end = m.end()
+            while end < len(line) and line[end] not in PATH_STOP:
+                end += 1
+            token = line[m.start():end]
+            hit = owner_by_gitdir(cands, token) or owner(cands, m.group(1))
+            if not hit:
+                continue
+            ts = None
+            if '"timestamp"' in line:
+                try:
+                    ts = parse_ts(json.loads(line).get("timestamp"))
+                except ValueError:
+                    ts = None
+            return (ts, hit[1], hit[2])
     return None
 
 
