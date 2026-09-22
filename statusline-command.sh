@@ -187,22 +187,49 @@ import json, os, re, subprocess, sys
 WINDOW = 2097152  # 2 MiB
 
 
+def safe_gitdir(path):
+    """The private gitdir this worktree is registered under, via its .git file.
+
+    For a linked worktree <path>/.git is a file holding "gitdir: <path>" (for
+    the main worktree it is a real directory, so this returns None). That is
+    the only reliable join to .git/worktrees/*: Git derives the private
+    gitdir's NAME from the worktree's basename but appends a counter on
+    collision (foo, foo1), so matching by name silently misses.
+    """
+    try:
+        with open(os.path.join(path, ".git"), encoding="utf-8", errors="replace") as f:
+            head = f.readline().strip()
+    except OSError:
+        return None
+    if not head.startswith("gitdir:"):
+        return None
+    return os.path.realpath(head[len("gitdir:"):].strip())
+
+
 def candidates(repo):
-    """Worktrees other than the main one, alive and usable.
+    """Every alive, usable worktree -- main one included.
 
     "git worktree list" reports every worktree ever registered, including ones
     whose directory is gone (that is what the prunable flag means), so both the
-    flag and an isdir check have to filter. The main worktree is dropped because
-    showing its branch is exactly the old behaviour this replaces.
+    flag and an isdir check have to filter.
+
+    The main worktree must stay in: it is not just the fallback. Once a session
+    has written a file in a linked worktree, dropping the main one means its
+    newer writes can never claim the branch back, so the bar would keep showing
+    the linked worktree long after the session moved home.
+
+    -z: NUL-terminated fields, so a path holding a newline cannot split a block
+    (a plain newline-separated parse would). The block separator is an empty
+    field either way.
     """
     try:
         out = subprocess.run(
-            ["git", "--no-optional-locks", "-C", repo, "worktree", "list", "--porcelain"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout
+            ["git", "--no-optional-locks", "-C", repo, "worktree", "list", "--porcelain", "-z"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     blocks, cur = [], None
-    for line in out.decode("utf-8", "replace").splitlines():
+    for line in out.decode("utf-8", "replace").split("\0"):
         if not line.strip():
             if cur is not None:
                 blocks.append(cur)
@@ -219,7 +246,7 @@ def candidates(repo):
         blocks.append(cur)
 
     found = []
-    for b in blocks[1:]:
+    for b in blocks:
         path = b.get("worktree", "")
         if not path or "prunable" in b["flags"] or not os.path.isdir(path):
             continue
@@ -232,7 +259,7 @@ def candidates(repo):
             # Matching runs on realpath: git reports the resolved path while the
             # transcript quotes whatever the session typed, so /tmp vs
             # /private/tmp (a macOS symlink) would otherwise never match.
-            found.append((os.path.realpath(path), path, name))
+            found.append((os.path.realpath(path), path, name, safe_gitdir(path)))
     return found
 
 
@@ -240,7 +267,7 @@ def owner(cands, path):
     """Longest prefix wins, so a nested worktree cannot claim its parent's files."""
     path = os.path.realpath(path)
     best = None
-    for real, orig, br in cands:
+    for real, orig, br, _ in cands:
         if path == real or path.startswith(real + "/"):
             if best is None or len(real) > len(best[0]):
                 best = (real, orig, br)
@@ -248,30 +275,40 @@ def owner(cands, path):
 
 
 def owner_by_gitdir(cands, path):
-    """Map <repo>/.git/worktrees/<name>/... back to a worktree.
+    """Map <repo>/.git/worktrees/<id>/... back to its worktree.
 
-    <name> is the basename of the worktree's directory (verified against a real
-    repo), which is how per-worktree state files -- such as the ones the
-    feature-development workflow keeps -- identify their tree. Accepted only
-    when exactly one candidate carries that basename, so lookalike names can
-    never silently pick the wrong tree.
+    Per-worktree state files (the feature-development workflow keeps one) live
+    there, so this is how they identify their tree. The join uses the gitdir
+    that safe_gitdir() read off each worktree, not the basename -- see there.
     """
-    marker = "/.git/worktrees/"
-    i = path.find(marker)
-    if i < 0:
-        return None
-    name = path[i + len(marker):].split("/", 1)[0]
-    if not name:
-        return None
-    hit = [c for c in cands if os.path.basename(c[1]) == name]
-    return hit[0] if len(hit) == 1 else None
+    path = os.path.realpath(path)
+    best = None
+    for real, orig, br, gitdir in cands:
+        if not gitdir:
+            continue
+        if path == gitdir or path.startswith(gitdir + "/"):
+            if best is None or len(gitdir) > len(best[0]):
+                best = (gitdir, orig, br)
+    return best
 
 
-def backup_time(meta):
+def parse_ts(value):
+    """Milliseconds since epoch, or None when absent/unusable.
+
+    Deliberately not 0: a timestamp that failed to parse is not evidence of
+    being old, and collapsing it to 0 would let it silently lose (or win) the
+    race below. The caller decides what a missing timestamp means.
+    """
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        return int(meta.get("backupTime") or 0)
-    except (AttributeError, TypeError, ValueError):
-        return 0
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def meta_ts(meta):
+    return parse_ts(meta.get("backupTime")) if isinstance(meta, dict) else None
 
 
 def from_snapshot(cands, lines):
@@ -293,17 +330,28 @@ def from_snapshot(cands, lines):
             continue
         cwd = obj.get("cwd") or ""
         tracked = snap["trackedFileBackups"]
-        for path, meta in sorted(tracked.items(), key=lambda kv: backup_time(kv[1]), reverse=True):
+        for path, meta in sorted(tracked.items(), key=lambda kv: meta_ts(kv[1]) or 0, reverse=True):
             if not path:
                 continue
             full = path if os.path.isabs(path) else os.path.normpath(os.path.join(cwd, path))
-            hit = owner(cands, full) or owner_by_gitdir(cands, full)
+            # gitdir first: <repo>/.git/worktrees/<id>/... sits UNDER the main
+            # worktree's path, so a plain prefix match would hand it to main.
+            hit = owner_by_gitdir(cands, full) or owner(cands, full)
             if hit:
-                return (backup_time(meta), hit[1], hit[2])
+                return (meta_ts(meta), hit[1], hit[2])
         # The set only grows: if nothing in the newest snapshot maps, no older
         # one can either.
         return None
     return None
+
+
+# Characters that end a path token when the text signal widens a match. Kept
+# permissive (anything but these) so non-ASCII names such as docs/F3.3-审核 stay
+# in one token; a wrong extension only fails to resolve, which just falls back.
+# The quote and backtick are hex escapes on purpose: a literal backtick inside
+# a $( ) heredoc body can pair up with another one and break bash's parse of
+# the whole script (worth knowing when editing these blocks).
+PATH_STOP = set(" \t\r\n\"\x27\x60()[]{}<>,;:=|")
 
 
 def from_text(cands, lines, pattern):
@@ -312,20 +360,30 @@ def from_text(cands, lines, pattern):
     Covers the gap between "worktree created" and "first file written into it",
     where the snapshot signal has nothing yet. The lookahead is what stops
     .../F3.3-accuracy-reco from matching .../F3.3-accuracy-recognition.
+
+    The match is widened to the whole path token before resolving, for the same
+    reason the snapshot signal resolves gitdir first: <repo>/.git/worktrees/<id>
+    /... starts with the main worktree's own path, so a bare prefix match would
+    hand a linked worktree's state file to main.
     """
     for line in reversed(lines):
-        hits = pattern.findall(line)
-        if not hits:
+        matches = list(pattern.finditer(line))
+        if not matches:
             continue
-        hit = owner(cands, hits[-1])
+        m = matches[-1]
+        end = m.end()
+        while end < len(line) and line[end] not in PATH_STOP:
+            end += 1
+        token = line[m.start():end]
+        hit = owner_by_gitdir(cands, token) or owner(cands, m.group(1))
         if not hit:
             continue
-        ts = 0
+        ts = None
         if '"timestamp"' in line:
             try:
-                ts = int(json.loads(line).get("timestamp") or 0)
-            except (ValueError, TypeError):
-                ts = 0
+                ts = parse_ts(json.loads(line).get("timestamp"))
+            except ValueError:
+                ts = None
         return (ts, hit[1], hit[2])
     return None
 
@@ -345,23 +403,42 @@ def main():
     # Both spellings of each worktree go into the pattern: the transcript quotes
     # the path as it was typed, while git reports it resolved, and on macOS
     # those can differ (/tmp vs /private/tmp). owner() realpaths whatever
-    # matched, so either spelling maps back to the same candidate. A symlinked
-    # alias git never reports (a work dir reachable under two names) is still
-    # missed here -- the snapshot signal has no such blind spot, since it
-    # realpaths the path it is handed.
+    # matched, so either spelling maps back to the same candidate.
+    #
+    # The main worktree is deliberately NOT in this set. Signal A carries it
+    # (that is what lets a session come home after working in a linked tree),
+    # and the launch-dir fallback covers it too; what signal A cannot see, this
+    # one only needs to cover for linked worktrees. Including main instead let
+    # any prose mention of a path inside the repo outrank real writes -- the
+    # closing report of a turn does that constantly. Measured: the newest
+    # assistant message beat a genuine write by ~2 minutes and flipped
+    # feature/F3.3-accuracy-recovery to develop. A symlinked alias git never
+    # reports is likewise missed here; signal A has no such blind spot.
     forms = []
-    for real, orig, _ in cands:
+    for real, orig, _, gitdir in cands:
+        if not gitdir:
+            continue  # main worktree (or an unreadable .git): signal A's job
         for f in (orig, real):
             if f not in forms:
                 forms.append(f)
-    pattern = re.compile("(" + "|".join(re.escape(f) for f in forms) + ")(?![A-Za-z0-9._-])")
+    # No linked worktree means no cold-start signal at all -- and an empty
+    # alternation would compile to a pattern matching every line.
+    pattern = None
+    if forms:
+        pattern = re.compile("(" + "|".join(re.escape(f) for f in forms) + ")(?![A-Za-z0-9._-])")
 
     # The two signals are raced by their own timestamps: whichever activity is
-    # more recent is the better evidence of where the session is working.
+    # more recent is the better evidence of where the session is working. A
+    # missing timestamp (None) never outranks a present one -- it means the
+    # field was absent or unparseable, which says nothing about recency, so the
+    # snapshot signal keeps its precedence instead of losing to a 0.
     best = from_snapshot(cands, lines)
-    other = from_text(cands, lines, pattern)
-    if other is not None and (best is None or other[0] > best[0]):
-        best = other
+    other = from_text(cands, lines, pattern) if pattern else None
+    if other is not None:
+        if best is None:
+            best = other
+        elif other[0] is not None and (best[0] is None or other[0] > best[0]):
+            best = other
     if best is not None:
         sys.stdout.write("%s\t%s\n" % (best[1], best[2]))
 
@@ -599,7 +676,7 @@ def walk(root, out):
             stack.extend(node)
 
 def collect_vals(path, out):
-    # Sum one transcript file into `out`: JSONL line by line, and only when
+    # Sum one transcript file into "out": JSONL line by line, and only when
     # no line parsed, one guarded attempt at the whole file as a single JSON
     # document (first non-space byte must be '{' or '['). A file that cannot
     # be opened or parsed contributes nothing instead of failing the bar.

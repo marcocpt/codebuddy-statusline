@@ -49,8 +49,11 @@ changed = False
 if "statusLine" in d and isinstance(d["statusLine"], dict):
     cmd = d["statusLine"].get("command", "")
     # 把任何旧的 /Users/<谁>/.codebuddy/statusline-command.sh 换成目标机路径
+    # 直接写脚本绝对路径（不加 bash 前缀）：App 是把它当可执行文件 exec 的，
+    # 所以上面的 chmod +x 是硬要求。写成 "bash <path>" 会与 README 声明的合同
+    # 不一致，也会掩盖丢失可执行位这一失败模式。
     if "statusline-command.sh" in cmd:
-        d["statusLine"]["command"] = f"bash {home}/.codebuddy/statusline-command.sh"
+        d["statusLine"]["command"] = f"{home}/.codebuddy/statusline-command.sh"
         changed = True
 json.dump(d, open(out, "w"), indent=2, ensure_ascii=False)
 print("✓ settings.json 已写入，statusLine.command 路径" + ("已更新为目标机" if changed else "无需更改"))
