@@ -19,6 +19,24 @@
 #            magenta; the whole segment is omitted when unknown
 #   积分：    本会话累计消耗 / 套餐剩余 (credits), khaki
 #
+# Where ctx comes from, in order
+#   1. context_window.used_percentage in the payload -- the CLI's own number,
+#      totalInputTokens / context budget.
+#   2. context_window.current_usage, summed, divided by context_window_size.
+#      Used when used_percentage is absent but the usage object is present.
+#   3. the newest usage entry in the transcript, divided by
+#      context_window_size. This is the one that runs right after a compaction:
+#      the summary replacing the history carries no usage of its own, so the
+#      CLI emits used_percentage: null AND drops current_usage, and both paths
+#      above miss.
+#      It must read that entry as JSON and take ONE canonical number
+#      (providerData.usage.inputTokens). An earlier revision grepped the line
+#      for every token-ish key and summed them, which overstated by ~4x -- one
+#      request's counts are recorded three times on a line (providerData
+#      .rawUsage snake_case, providerData.usage camelCase, message.usage
+#      snake_case) -- so a 51.5%-full 1M window rendered as "ctx: 206%".
+#      Measured over 30654 real usage lines: 3.00x-4.38x, median 4.00x.
+#
 # Where the account and 积分 segments come from
 #   Both are produced by one helper, credits-fetch.py, which
 #     1. resolves the account the CLI is *actually* using -- wb-switch's
@@ -560,16 +578,83 @@ if [ -z "$pct" ]; then
   fi
 fi
 if [ -z "$pct" ] && [ -n "$transcript" ] && [ -r "$transcript" ]; then
-  # Fall back to the newest usage block in the transcript. tail seeks to the
-  # end, so this stays cheap on multi-megabyte transcripts.
-  usage_line=$(tail -n 4000 "$transcript" 2>/dev/null \
-    | grep -E '"(input_tokens|inputTokens|prompt_tokens|promptTokens)"' \
-    | tail -n 1)
-  if [ -n "$usage_line" ]; then
-    used=$(printf '%s' "$usage_line" \
-      | grep -oE '"(input_tokens|inputTokens|prompt_tokens|promptTokens|cache_read_input_tokens|cacheReadInputTokens|cache_creation_input_tokens|cacheCreationInputTokens|output_tokens|outputTokens)"[[:space:]]*:[[:space:]]*[0-9]+' \
-      | sed -E 's/.*:[[:space:]]*//' \
-      | awk '{ s += $1 } END { print s + 0 }')
+  # Fall back to the newest usage block in the transcript.
+  #
+  # Read it as JSON and take ONE canonical number. The old revision grepped the
+  # line for every token-ish key and SUMMED them, which overstated by ~4x: one
+  # request's counts are recorded THREE times on the same line --
+  #   providerData.rawUsage  snake_case (prompt_tokens, cache_read_input_tokens)
+  #   providerData.usage     camelCase  (inputTokens, outputTokens)
+  #   message.usage          snake_case (input_tokens, cache_read_input_tokens)
+  # so a 51.5%-full 1M window rendered as "ctx: 206%". Measured over 30654 real
+  # usage lines the old sum ran 3.00x-4.38x the truth, median exactly 4.00x.
+  #
+  # This path is what runs right after a compaction: the summary that replaces
+  # the history carries no usage of its own, so the CLI emits
+  # "used_percentage": null and omits current_usage entirely, both primary
+  # paths above miss, and the transcript is all that is left.
+  #
+  # inputTokens is the single right source: it mirrors the CLI's own
+  # getCurrentContextUsage(), whose totalInputTokens reduces to inputTokens
+  # (the normalized count already folds cache read/creation back in).
+  used=''
+  if [ -n "$python3_bin" ]; then
+    used=$("$python3_bin" - "$transcript" <<'PYUSAGE' 2>/dev/null
+import json, sys
+
+# Scan the transcript tail, newest line first. 2 MiB is generous -- the newest
+# usage entry is within a turn or two of the end -- and reading backwards with
+# an early exit costs only as much as the answer is far away.
+WINDOW = 2097152
+
+
+def newest_input_tokens(path):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - WINDOW))
+        text = f.read().decode("utf-8", "replace")
+    for line in reversed(text.splitlines()):
+        # Cheap pre-filter: only a line that mentions a token count can carry
+        # the usage block, and this keeps json.loads off almost every line.
+        if "inputTokens" not in line and "input_tokens" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        pd = obj.get("providerData")
+        usage = pd.get("usage") if isinstance(pd, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        n = usage.get("inputTokens")
+        # bool is an int subclass, so it is excluded explicitly.
+        if isinstance(n, bool) or not isinstance(n, (int, float)):
+            continue
+        return int(n)
+    return 0
+
+
+try:
+    print(newest_input_tokens(sys.argv[1]))
+except Exception:
+    # Never break the statusline: no usable number means "leave ctx off".
+    print(0)
+PYUSAGE
+)
+  fi
+  # No python3 (or it found nothing): take the same number with grep. The
+  # camelCase "inputTokens" is the one unambiguous spelling -- it occurs at most
+  # once per line (verified across 45454 real usage lines), so unlike the
+  # snake_case aliases the old revision summed, picking it cannot double count.
+  if [ -z "$used" ] || [ "$used" = 0 ]; then
+    used=$(tail -n 4000 "$transcript" 2>/dev/null \
+      | grep -o '"inputTokens"[[:space:]]*:[[:space:]]*[0-9]\+' \
+      | tail -n 1 \
+      | sed -E 's/.*:[[:space:]]*//')
+  fi
+  used=$(printf '%s' "$used" | tr -dc '0-9')
+  if [ -n "$used" ] && [ "$used" -gt 0 ]; then
     [ -n "$size" ] || size=${CODEBUDDY_CONTEXT_WINDOW:-200000}
     pct=$(awk -v u="$used" -v w="$size" 'BEGIN{
       if (u + 0 <= 0 || w + 0 <= 0) { print ""; exit }
@@ -802,8 +887,10 @@ if [ "$(cat /tmp/statusline-debug.on 2>/dev/null)" = on ]; then
     echo "--- first 1200 bytes of transcript ---"
     head -c 1200 "$transcript" 2>/dev/null
     echo
-    echo "--- newest usage line ---"
-    printf '%.1500s\n' "$usage_line"
+    echo "--- newest usage line (for eyeballing only; never summed) ---"
+    tail -n 4000 "$transcript" 2>/dev/null \
+      | grep -E '"(input_tokens|inputTokens|prompt_tokens|promptTokens)"' \
+      | tail -n 1 | cut -c1-1500
     echo "--- used=${used:-none} size=${size:-none} pct=${pct:-none} ---"
     echo "--- credits cumulative sum ---"
     echo "used=${credits_used:-none} cache=$(tail -n 1 /tmp/statusline-credits-sum.cache 2>/dev/null)"
